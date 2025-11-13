@@ -1,3 +1,4 @@
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
@@ -18,6 +19,12 @@ api_key = ""
 bookmakers = '1xbet'
 
 
+def get_all_sports():
+    url = "https://api.odds-api.io/v3/sports"
+    response = requests.get(url)
+    return response.json()
+
+
 def fetch_events(sport, api_key):
     response = requests.get(
         'https://api.odds-api.io/v3/events',
@@ -29,6 +36,7 @@ def fetch_events(sport, api_key):
     )
     events = response.json()
     return events
+
 
 def fetch_events_with_status(sport, api_key, status):
     response = requests.get(
@@ -43,10 +51,14 @@ def fetch_events_with_status(sport, api_key, status):
     events = response.json()
     return events
 
-def fetch_odds(event, api_key, bookmakers):
+
+def fetch_odds(event, api_key, bookmakers, stop_flag):
     """Fetch odds for a single event."""
-    event_id = event.get("id")
+    if stop_flag.is_set():
+        return None
+
     try:
+        event_id = event.get("id")
         response = requests.get(
             "https://api.odds-api.io/v3/odds",
             params={
@@ -67,22 +79,85 @@ def fetch_odds(event, api_key, bookmakers):
     except requests.exceptions.RequestException as e:
         print(f"❌ Error fetching odds for {event_id}: {e}")
         return None
+    except Exception as e:
+        print(f"❌ Error fetching odds: {e}")
+        return None
 
 
-def fetch_all_odds(events, api_key, bookmakers, odds_limit, max_workers=15):
-    """Fetch odds for multiple events concurrently."""
+def fetch_multi_odds(events, api_key, bookmakers, stop_flag):
+    """Fetch odds for a multi event upto 10."""
+    if stop_flag.is_set():
+        return None
+
+    try:
+        event_ids = [event.get("id") for event in events if isinstance(event, dict)]
+        response = requests.get(
+            "https://api.odds-api.io/v3/odds/multi",
+            params={
+                "apiKey": api_key,
+                "eventIds": event_ids,
+                "bookmakers": bookmakers
+            },
+            timeout=10
+        )
+        response.raise_for_status()
+        data = response.json()
+        data = [event for event in data if len(event.get("bookmakers"))]
+
+        return data
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error fetching odds for {event_ids}: {e}")
+        return None
+    except Exception as e:
+        print(f"❌ Error fetching odds: {e}")
+        return None
+
+
+def chunk_events(events, chunk_size=10):
+    """Split events into chunks of given size."""
+    for i in range(0, len(events), chunk_size):
+        yield events[i:i + chunk_size]
+
+
+def fetch_all_odds(events, api_key, bookmakers, odds_limit=None, max_workers=15):
     odds_results = []
+    stop_flag = threading.Event()
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_event = {executor.submit(fetch_odds, event, api_key, bookmakers): event for event in events}
-        for future in as_completed(future_to_event):
+        futures = [
+            executor.submit(fetch_multi_odds, event, api_key, bookmakers, stop_flag)
+            for event in events
+        ]
+
+        for future in as_completed(futures):
+            if stop_flag.is_set():
+                break
+
             result = future.result()
-            if result:
-                odds_results.append(result)
-            if len(odds_results) >= odds_limit:
-                return odds_results
+            if result and len(result):
+                odds_results.extend(result)
+
+            if odds_limit and len(odds_results) >= odds_limit:
+                stop_flag.set()  # signal all threads to stop further work
+                break
+
     return odds_results
 
 
-events = fetch_events('football', api_key)
-odds = fetch_all_odds(events, api_key, bookmakers, 100)
-print(odds)
+def get_odds_for_all_sport(api_key, bookmakers, status, odds_limit, events_limit=None):
+    sports = get_all_sports()
+    sports_odds = {}
+    for sport in sports:
+        print("Started for sport", sport)
+        events = fetch_events_with_status(sport.get('slug'), api_key, status)
+        events = events[:events_limit] if events_limit else events
+        chunks = [events[i:i+10] for i in range(0, len(events), 10)]
+        odds = fetch_all_odds(chunks, api_key, bookmakers, odds_limit)
+        sports_odds[sport.get('slug')] = odds
+        print("Finished for sport", sport)
+    return sports_odds
+
+
+if __name__ == "__main__":
+    sports_odds = get_odds_for_all_sport(api_key, bookmakers, 'pending', odds_limit=5, events_limit=1000)
+    print(sports_odds)
