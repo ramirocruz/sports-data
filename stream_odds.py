@@ -8,6 +8,17 @@ from requests.exceptions import ChunkedEncodingError, RequestException
 from tabulate import tabulate
 
 
+def fetch_leagues(sport, api_key):
+    response = requests.get(
+        'https://api.opticodds.com/api/v3/leagues',
+        params={
+            'key': api_key,
+            'sport': sport
+        }
+    )
+    events = response.json()
+    return [event.get('id') for event in events.get('data')]
+
 class OpticOddsManager:
     """Lightweight version — no DB, only prints odds in tabular form."""
 
@@ -168,7 +179,9 @@ class OpticOddsManager:
                     league_ids=None,
                     fixture_ids=None,
                     sportsbooks=None,
-                    markets=None):
+                    markets=None,
+                    show_raw_table=True,
+                    verbose=True):
 
         # Background printer
         def printer_thread():
@@ -176,7 +189,8 @@ class OpticOddsManager:
                 time.sleep(self.auto_print_interval)
                 try:
                     self.print_live_table()
-                    self.print_raw_table()  # NEW TABLE
+                    if show_raw_table:
+                        self.print_raw_table()  # NEW TABLE
                 except Exception as e:
                     print("[printer] error:", e)
 
@@ -232,7 +246,8 @@ class OpticOddsManager:
                     line = raw.strip()
 
                     # Debug raw line
-                    print("RAW:", repr(line))
+                    if verbose:
+                        print("RAW:", repr(line))
 
                     if line.startswith("event:"):
                         event_type = line.split(":", 1)[1].strip()
@@ -292,13 +307,18 @@ if __name__ == "__main__":
     api_key = "c7d9514b-275f-4d64-9710-87f90922eed4"
 
     manager = OpticOddsManager(api_key=api_key, auto_print_interval=5)
+    sport = 'football'
 
-    print("Starting esports stream…")
-    leagues = ["cs2", "dota_2", "league_of_legends", "starcraft_2", "valorant"]
+    print(f"Starting {sport} stream…")
+
+    leagues = fetch_leagues(sport, api_key)
+    print(f"Leagues are ... {leagues}")
     sportsbooks = ["1xbet"]
 
     manager.stream_odds(
-        sport="esports",
+        sport=sport,
         league_ids=leagues,
-        sportsbooks=sportsbooks
+        sportsbooks=sportsbooks,
+        show_raw_table=False,
+        verbose=False
     )
