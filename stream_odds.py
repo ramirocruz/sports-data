@@ -1,324 +1,396 @@
 import requests
+from requests.exceptions import ChunkedEncodingError
 import json
-import time
-import threading
 from datetime import datetime
-from typing import Dict, List, Optional
-from requests.exceptions import ChunkedEncodingError, RequestException
+from collections import defaultdict
+import os
 from tabulate import tabulate
+from rich.console import Console
+from rich.table import Table
+import pandas as pd
 
 
-def fetch_leagues(sport, api_key):
-    response = requests.get(
-        'https://api.opticodds.com/api/v3/leagues',
-        params={
-            'key': api_key,
-            'sport': sport
+class OddsDisplayManager:
+    """Manage and display odds in various tabular formats"""
+
+    def __init__(self, odds_format='american', status='active'):
+        self.odds_store = {}  # Store latest odds by fixture_id + market
+        self.stats = {
+            'total_updates': 0,
+            'active_fixtures': set(),
+            'locked_count': 0
         }
-    )
-    events = response.json()
-    return [event.get('id') for event in events.get('data')]
+        self.odds_format = odds_format  # 'american', 'decimal', or 'fractional'
+        self.status = status
 
-class OpticOddsManager:
-    """Lightweight version — no DB, only prints odds in tabular form."""
-
-    def __init__(self, api_key: str, auto_print_interval: int = 5):
-        self.api_key = api_key
-        self.last_entry_id: Optional[str] = None
-        self.auto_print_interval = auto_print_interval
-        self._stop_printer = False
-
-        # in-memory odds: { odds_id → odds object }
-        self.odds_store: Dict[str, Dict] = {}
-
-    # ------------------------------------
-    # Convert American → Decimal
-    # ------------------------------------
     @staticmethod
-    def american_to_decimal(american):
-        if american is None:
-            return None
-        try:
-            american = float(american)
-        except:
+    def american_to_decimal(american_odds):
+        """Convert American odds to Decimal odds"""
+        if american_odds is None:
             return None
 
-        if american > 0:
-            return (american / 100) + 1
+        if american_odds > 0:
+            # Positive odds: (American odds / 100) + 1
+            return round((american_odds / 100) + 1, 2)
         else:
-            return (100 / abs(american)) + 1
+            # Negative odds: (100 / |American odds|) + 1
+            return round((100 / abs(american_odds)) + 1, 2)
 
-    # ------------------------------------
-    # Upsert odds into in-memory store
-    # ------------------------------------
-    def upsert_odds(self, data_list: List[Dict]):
-        for odd in data_list:
-            oid = odd.get("id")
-            if not oid:
+    @staticmethod
+    def american_to_fractional(american_odds):
+        """Convert American odds to Fractional odds"""
+        if american_odds is None:
+            return None
+
+        if american_odds > 0:
+            return f"{american_odds}/100"
+        else:
+            return f"100/{abs(american_odds)}"
+
+    def format_price(self, price):
+        """Format price based on selected format"""
+        if price is None:
+            return "N/A"
+
+        if self.odds_format == 'decimal':
+            return str(self.american_to_decimal(price))
+        elif self.odds_format == 'fractional':
+            return self.american_to_fractional(price)
+        else:  # american (default)
+            return f"{'+' if price > 0 else ''}{price}"
+
+    def update_odds(self, odds_list, status='active'):
+        """Update internal odds storage"""
+        for odd in odds_list:
+            key = odd.get('id', '##')
+
+            self.odds_store[key] = {
+                'fixture_id': odd['fixture_id'],
+                'league': odd['league'],
+                'market': odd['market'],
+                'sportsbook': odd['sportsbook'],
+                'name': odd['name'],
+                'selection': odd.get('selection', ''),
+                'price_american': odd['price'],  # Store original
+                'price': self.format_price(odd['price']),  # Store formatted
+                'points': odd.get('points'),
+                'is_main': odd.get('is_main', False),
+                'is_live': odd.get('is_live', False),
+                'status': status,
+                'last_updated': datetime.now().strftime('%H:%M:%S'),
+                'game_id': odd['game_id']
+            }
+
+            self.stats['total_updates'] += 1
+            self.stats['active_fixtures'].add(odd['fixture_id'])
+            if status == 'locked':
+                self.stats['locked_count'] += 1
+
+    # ===== METHOD 1: Simple Text Table =====
+    def display_simple_table(self, max_rows=20):
+        """Display odds in a simple text table
+
+        Args:
+            max_rows: Maximum number of rows to display
+        """
+        os.system('clear' if os.name == 'posix' else 'cls')
+
+        print("=" * 120)
+        print(f"ODDS MONITOR - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(
+            f"Total Updates: {self.stats['total_updates']} | Active Fixtures: {len(self.stats['active_fixtures'])} | Locked: {self.stats['locked_count']}")
+        print("=" * 120)
+
+        if not self.odds_store:
+            print("No odds data yet...")
+            return
+
+        # Original display logic
+        odds_data = self.odds_store.values()
+        if self.status != 'all':
+            odds_data = filter(lambda x: x['status'] == self.status, odds_data)
+        sorted_odds = sorted(odds_data,
+                             key=lambda x: (x['fixture_id'], x['market'], -x['price_american']))
+
+        print(
+            f"\n{'League':<10} {'Market':<25} {'Book':<12} {'Selection':<30} {'Price':<8} {'Status':<8} {'Updated':<10}")
+        print("-" * 120)
+
+        for i, odd in enumerate(sorted_odds[:max_rows]):
+            status_symbol = "🟢" if odd['status'] == 'active' else "🔴"
+            print(f"{odd['league']:<10} {odd['market'][:24]:<25} {odd['sportsbook']:<12} "
+                  f"{odd['name'][:29]:<30} {odd['price']:<8} {status_symbol} {odd['status']:<8} {odd['last_updated']:<10}")
+
+    # ===== METHOD 2: Tabulate Library =====
+    def display_tabulate(self, max_rows=20):
+        """Display using tabulate library (prettier)
+
+        Args:
+            max_rows: Maximum number of rows to display
+        """
+        os.system('clear' if os.name == 'posix' else 'cls')
+
+        print(f"\nODDS MONITOR - {datetime.now().strftime('%H:%M:%S')}")
+        print(
+            f"Updates: {self.stats['total_updates']} | Fixtures: {len(self.stats['active_fixtures'])} | Locked: {self.stats['locked_count']}\n")
+
+        if not self.odds_store:
+            print("No odds data yet...")
+            return
+
+        odds_data = self.odds_store.values()
+        if self.status != 'all':
+            odds_data = filter(lambda x: x['status'] == self.status, odds_data)
+        sorted_odds = sorted(odds_data,
+                             key=lambda x: (x['fixture_id'], x['market'], -x['price_american']))[:max_rows]
+
+        table_data = []
+        for odd in sorted_odds:
+            table_data.append([
+                odd['league'],
+                odd['market'][:25],
+                odd['sportsbook'],
+                odd['name'][:30],
+                odd['price'],
+                "✓" if odd['status'] == 'active' else "✗",
+                odd['last_updated']
+            ])
+
+        headers = ['League', 'Market', 'Sportsbook', 'Selection', 'Price', 'Status', 'Updated']
+        print(tabulate(table_data, headers=headers, tablefmt='grid'))
+
+    # ===== METHOD 3: Rich Library (Fancy) =====
+    def display_rich(self):
+        """Display using rich library with colors"""
+        table = Table(title=f"📊 Live Odds Monitor - {datetime.now().strftime('%H:%M:%S')}")
+
+        table.add_column("League", style="cyan", no_wrap=True)
+        table.add_column("Market", style="magenta")
+        table.add_column("Sportsbook", style="green")
+        table.add_column("Selection", style="yellow")
+        table.add_column("Price", justify="right", style="bold blue")
+        table.add_column("Status", justify="center")
+        table.add_column("Updated", style="dim")
+
+        odds_data = self.odds_store.values()
+        if self.status != 'all':
+            odds_data = filter(lambda x: x['status'] == self.status, odds_data)
+        sorted_odds = sorted(odds_data,
+                             key=lambda x: (x['fixture_id'], x['market'], -x['price_american']))[:30]
+
+        for odd in sorted_odds:
+            status = "[green]✓ Active[/green]" if odd['status'] == 'active' else "[red]✗ Locked[/red]"
+            table.add_row(
+                odd['league'],
+                odd['market'][:25],
+                odd['sportsbook'],
+                odd['name'][:30],
+                str(odd['price']),
+                status,
+                odd['last_updated']
+            )
+
+        return table
+
+    # ===== METHOD 4: Pandas DataFrame =====
+    def get_dataframe(self):
+        """Return odds as pandas DataFrame"""
+        if not self.odds_store:
+            return pd.DataFrame()
+
+        odds_data = self.odds_store.values()
+        if self.status != 'all':
+            odds_data = filter(lambda x: x['status'] == self.status, odds_data)
+
+        df = pd.DataFrame(list(odds_data))
+        return df
+
+    # ===== METHOD 5: Market Comparison View =====
+    def display_market_comparison(self, fixture_id=None, market_filter=None):
+        """Compare odds across sportsbooks for same market"""
+        os.system('clear' if os.name == 'posix' else 'cls')
+
+        print("=" * 100)
+        print("SPORTSBOOK COMPARISON VIEW")
+        print("=" * 100)
+
+        # Group by fixture and market
+        grouped = defaultdict(lambda: defaultdict(list))
+
+        odds_data = self.odds_store.values()
+        if self.status != 'all':
+            odds_data = filter(lambda x: x['status'] == self.status, odds_data)
+
+        for odd in odds_data:
+            if fixture_id and odd['fixture_id'] != fixture_id:
+                continue
+            if market_filter and market_filter.lower() not in odd['market'].lower():
                 continue
 
-            # keep a raw (unmodified) copy
-            odd["_raw"] = dict(odd)
+            key = f"{odd['fixture_id']}_{odd['market']}"
+            grouped[key][odd['name']].append({
+                'sportsbook': odd['sportsbook'],
+                'price': odd['price'],
+                'price_american': odd['price_american'],
+                'status': odd['status']
+            })
 
-            # decimal conversion only for display table
-            odd["decimal_price"] = self.american_to_decimal(odd.get("price"))
-            self.odds_store[oid] = odd
+        for market_key, selections in grouped.items():
+            print(f"\n{market_key}")
+            print("-" * 100)
 
-    # ------------------------------------
-    # Safe JSON parsing for SSE
-    # ------------------------------------
-    @staticmethod
-    def _parse_json_safe(s: str):
-        s = s.strip()
-        if not s:
-            raise ValueError("Empty JSON string")
+            for selection, books in selections.items():
+                best_price = max(books, key=lambda x: x['price_american'] if x['status'] == 'active' else -9999)
+                print(f"\n  {selection}:")
 
+                for book in sorted(books, key=lambda x: -x['price_american']):
+                    status = "✓" if book['status'] == 'active' else "✗"
+                    best_marker = " ⭐ BEST" if book == best_price and book['status'] == 'active' else ""
+                    print(f"    {book['sportsbook']:<15} {book['price']:>8} {status}{best_marker}")
+
+    # ===== METHOD 6: CSV Export =====
+    def export_to_csv(self, filename='odds_snapshot.csv'):
+        """Export current odds to CSV"""
+        df = self.get_dataframe()
+        df.to_csv(filename, index=False)
+
+        print(f"\n✓ Exported {len(self.odds_store)} odds to {filename}")
+
+
+def stream_with_display(api_key, sport='football', display_method='simple', odds_format='decimal', status='active'):
+    """Stream odds with chosen display method and odds format
+
+    Args:
+        api_key: Your OpticOdds API key
+        sport: Sport to stream (football, esports, basketball, etc.)
+        display_method: 'simple', 'tabulate', 'rich', 'comparison', 'dataframe'
+        odds_format: 'american', 'decimal', or 'fractional'
+        status: 'active', 'locked', or 'all'
+    """
+
+    # Fetch leagues
+    response = requests.get(
+        'https://api.opticodds.com/api/v3/leagues',
+        params={'key': api_key, 'sport': sport}
+    )
+    leagues = [event.get('id') for event in response.json().get('data')]
+
+    manager = OddsDisplayManager(odds_format=odds_format, status=status)
+    last_entry_id = None
+    update_counter = 0
+
+    # For rich live display
+    console = Console()
+
+    while True:
         try:
-            return json.loads(s)
-        except json.JSONDecodeError:
-            decoder = json.JSONDecoder()
-            idx = 0
-            while idx < len(s):
-                try:
-                    obj, end = decoder.raw_decode(s[idx:])
-                    return obj
-                except json.JSONDecodeError:
-                    idx += 1
-            raise
+            params = {
+                "key": api_key,
+                "sportsbook": ['1xbet'],
+                "league": leagues,
+            }
+            if last_entry_id:
+                params["last_entry_id"] = last_entry_id
 
-    # ------------------------------------
-    # Print the table (same structure)
-    # ------------------------------------
-    def print_live_table(self):
-        rows = list(self.odds_store.values())
-        if not rows:
-            print("\nNo odds received yet...")
-            return
+            r = requests.get(
+                f"https://api.opticodds.com/api/v3/stream/odds/{sport}",
+                params=params,
+                stream=True,
+            )
 
-        # Group by fixture → sportsbook
-        fixtures = {}
-        for r in rows:
-            fid = r.get("fixture_id") or "unknown"
-            fixtures.setdefault(fid, {"league": r.get("league"), "sport": r.get("sport"), "books": {}})
-            fixtures[fid]["books"].setdefault(r["sportsbook"], []).append(r)
+            if r.status_code != 200:
+                print(f"Error: {r.status_code} - {r.text}")
+                break
 
-        table = []
+            event_type = None
+            event_data = []
 
-        for fid, meta in fixtures.items():
-            for sb, entries in meta["books"].items():
+            for line in r.iter_lines(decode_unicode=True):
+                if not line or line == '':
+                    if event_type and event_data:
+                        data_str = '\n'.join(event_data)
 
-                # pick up to 2 selections
-                seen = {}
-                for e in entries:
-                    key = e.get("selection") or e.get("name")
-                    if key not in seen:
-                        seen[key] = e
-                    if len(seen) >= 2:
-                        break
+                        try:
+                            if event_type in ["odds", "locked-odds"]:
+                                data = json.loads(data_str)
+                                last_entry_id = data.get("entry_id")
+                                odds_list = data.get("data", [])
 
-                selected = list(seen.values())
+                                status = 'active' if event_type == 'odds' else 'locked'
+                                manager.update_odds(odds_list, status)
 
-                if len(selected) == 0:
-                    continue
-                if len(selected) == 1:  # pad second column
-                    selected.append({"name": "", "decimal_price": ""})
+                                # Update display every 5 updates
+                                if update_counter % 5 == 0:
+                                    if display_method == 'simple':
+                                        manager.display_simple_table()
+                                    elif display_method == 'tabulate':
+                                        manager.display_tabulate()
+                                    elif display_method == 'rich':
+                                        console.clear()
+                                        console.print(manager.display_rich())
+                                    elif display_method == 'comparison':
+                                        manager.display_market_comparison()
+                                    elif display_method == 'dataframe':
+                                        df = manager.get_dataframe()
+                                        print("\n" + "=" * 100)
+                                        print(df.head(20).to_string())
 
-                t1, t2 = selected[0], selected[1]
+                                update_counter += 1
 
-                table.append([
-                    fid,
-                    meta["league"] or "",
-                    sb,
-                    t1.get("name") or t1.get("selection") or "",
-                    t1.get("decimal_price") or "",
-                    t2.get("name") or t2.get("selection") or "",
-                    t2.get("decimal_price") or "",
-                ])
-
-        print("\n" + "=" * 72)
-        print(f" LIVE ODDS — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("=" * 72)
-        print(tabulate(
-            table,
-            headers=["Fixture ID", "League", "Sportsbook", "Team A", "Odds A", "Team B", "Odds B"],
-            tablefmt="fancy_grid"
-        ))
-        print("=" * 72 + "\n")
-
-    def print_raw_table(self):
-        rows = list(self.odds_store.values())
-        if not rows:
-            print("\nNo odds received yet...")
-            return
-
-        # Extract the raw dicts
-        raw_rows = [r["_raw"] for r in rows]
-
-        # Determine ALL possible keys dynamically
-        all_keys = sorted({k for row in raw_rows for k in row.keys()})
-
-        # Build table
-        table = []
-        for row in raw_rows:
-            table.append([row.get(k, "") for k in all_keys])
-
-        print("\n" + "=" * 72)
-        print(f" RAW ODDS (No Decimal Conversion) — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("=" * 72)
-        print(tabulate(
-            table,
-            headers=all_keys,
-            tablefmt="fancy_grid"
-        ))
-        print("=" * 72 + "\n")
-
-    # ------------------------------------
-    # Stream and process events
-    # ------------------------------------
-    def stream_odds(self, sport: str,
-                    league_ids=None,
-                    fixture_ids=None,
-                    sportsbooks=None,
-                    markets=None,
-                    show_raw_table=True,
-                    verbose=True):
-
-        # Background printer
-        def printer_thread():
-            while not self._stop_printer:
-                time.sleep(self.auto_print_interval)
-                try:
-                    self.print_live_table()
-                    if show_raw_table:
-                        self.print_raw_table()  # NEW TABLE
-                except Exception as e:
-                    print("[printer] error:", e)
-
-        threading.Thread(target=printer_thread, daemon=True).start()
-
-        url = f"https://api.opticodds.com/api/v3/stream/odds/{sport}"
-        backoff = 1
-
-        while True:
-            try:
-                params = {}
-                if league_ids:
-                    params["league"] = league_ids
-                if fixture_ids:
-                    params["fixture_id"] = fixture_ids
-                if sportsbooks:
-                    params["sportsbook"] = sportsbooks
-                if markets:
-                    params["market"] = markets
-                if self.last_entry_id:
-                    params["last_entry_id"] = self.last_entry_id
-
-                params["include_fixture_updates"] = True
-
-                headers = {
-                    "Accept": "text/event-stream",
-                    "Connection": "keep-alive",
-                    "X-API-KEY": self.api_key
-                }
-
-                params_with_key = dict(params, key=self.api_key)
-
-                print(f"\n[{datetime.now()}] Connecting to SSE stream...")
-                r = requests.get(url, headers=headers, params=params_with_key, stream=True, timeout=90)
-                print(f"[{datetime.now()}] Status = {r.status_code}")
-
-                if r.status_code != 200:
-                    print("Bad response: ", r.text[:300])
-                    time.sleep(backoff)
-                    backoff = min(backoff * 2, 60)
-                    continue
-
-                backoff = 1
-                print("Connected! Listening for odds…")
-
-                event_type = None
-                data_parts = []
-
-                for raw in r.iter_lines(decode_unicode=True):
-                    if raw is None:
-                        continue
-
-                    line = raw.strip()
-
-                    # Debug raw line
-                    if verbose:
-                        print("RAW:", repr(line))
-
-                    if line.startswith("event:"):
-                        event_type = line.split(":", 1)[1].strip()
-                        continue
-
-                    if line.startswith("data:"):
-                        data_parts.append(line.split(":", 1)[1].strip())
-                        continue
-
-                    if line == "" and (event_type or data_parts):
-                        full_data = "\n".join(data_parts).strip()
-
-                        if event_type in ("odds", "locked-odds"):
-                            try:
-                                payload = self._parse_json_safe(full_data)
-                            except Exception as ex:
-                                print("JSON parse error:", ex)
-                                print(full_data)
-                                event_type = None
-                                data_parts = []
-                                continue
-
-                            if isinstance(payload, dict) and payload.get("entry_id"):
-                                self.last_entry_id = payload["entry_id"]
-
-                            data_list = payload.get("data") or []
-
-                            if event_type == "odds":
-                                self.upsert_odds(data_list)
-                                print(f"[{datetime.now()}] ✓ Received {len(data_list)} odds")
-
-                            elif event_type == "locked-odds":
-                                print("[locked-odds] received")
+                        except json.JSONDecodeError as je:
+                            print(f"JSON error: {je}")
 
                         event_type = None
-                        data_parts = []
-                        continue
+                        event_data = []
+                    continue
 
-                print("Stream ended. Reconnecting...")
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+                if line.startswith('event:'):
+                    event_type = line.split(':', 1)[1].strip()
+                elif line.startswith('data:'):
+                    event_data.append(line.split(':', 1)[1].strip())
+                elif line.startswith('retry:') or line.startswith('id:'):
+                    pass
+                else:
+                    if event_data:
+                        event_data.append(line)
 
-            except Exception as e:
-                print("Error:", e)
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+        except ChunkedEncodingError:
+            print("Reconnecting...")
+        except KeyboardInterrupt:
+            print("\nStopping...")
+            # Export final snapshot
+            manager.export_to_csv(f'odds_snapshot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
+            break
+        except Exception as e:
+            print(f"Error: {e}")
+            break
 
-    # ------------------------------------
-    def stop(self):
-        self._stop_printer = True
 
-
-# -----------------------------------------
-# USAGE
-# -----------------------------------------
+# ===== MAIN USAGE =====
 if __name__ == "__main__":
     api_key = "c7d9514b-275f-4d64-9710-87f90922eed4"
 
-    manager = OpticOddsManager(api_key=api_key, auto_print_interval=5)
-    sport = 'football'
+    # Choose display method:
+    # 'simple' - basic text table
+    # 'tabulate' - prettier tables (requires: pip install tabulate)
+    # 'rich' - fancy colored tables (requires: pip install rich)
+    # 'comparison' - sportsbook comparison view
+    # 'dataframe' - pandas dataframe (requires: pip install pandas)
 
-    print(f"Starting {sport} stream…")
+    # Choose odds format:
+    # 'american' - American odds (e.g., -110, +200)
+    # 'decimal' - Decimal odds (e.g., 1.91, 3.00)
+    # 'fractional' - Fractional odds (e.g., 10/11, 2/1)
 
-    leagues = fetch_leagues(sport, api_key)
-    print(f"Leagues are ... {leagues}")
-    sportsbooks = ["1xbet"]
+    # Choose status of odds:
+    # 'active' - Show only active odds
+    # 'locked' - Show only locked odds
+    # 'all' - Show all odds
 
-    manager.stream_odds(
-        sport=sport,
-        league_ids=leagues,
-        sportsbooks=sportsbooks,
-        show_raw_table=False,
-        verbose=False
+    stream_with_display(
+        api_key,
+        sport='football',
+        display_method='dataframe',
+        odds_format='decimal',  # Change this to 'american' or 'fractional'
+        status='active'
     )
